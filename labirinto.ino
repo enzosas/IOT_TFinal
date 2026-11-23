@@ -1,3 +1,5 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
 #include <Wire.h>
 #include <TFT_eSPI.h>
 #include <Adafruit_MPU6050.h>
@@ -16,13 +18,54 @@ const int W = 240;
 const int H = 135;
 const int LED_PIN = 4; // na TTGO T-Display, o GPIO4 e o backlight da tela
 
-// LED verde de vitoria
 // LED verde de status do modulo (estilo KTANE): acende quando resolvido e fica aceso
 const int LED_VITORIA_PIN = 13;
 
 // Estado do modulo
 bool moduloResolvido = false;
-int strikes = 0; // bombas pisadas
+int strikes = 0; // bombas pisadas (contagem local; a central conta os oficiais)
+
+// =====================================================
+// REDE (WI-FI + MQTT) - protocolo RFC 001 da central
+// =====================================================
+
+// MODO DE TESTE: joga sem depender da central.
+//  - Ignora START/ativo/VICTORY/DEFEAT/RESET da central
+//  - Comeca jogando assim que liga; botao GPIO35 da placa gera labirinto novo
+//  - SOLVED/ERROR vao para jogo/modulo/<ID>/teste (a central nao conta)
+// Coloque false para a partida de verdade.
+const bool MODO_TESTE = true;
+const int BTN_NOVO_LABIRINTO = 35;
+
+// >>> TROQUE PELO NUMERO DO SEU GRUPO (2 a 11). Os dois precisam bater. <<<
+#define MODULO_ID  "6"
+#define MODULO_NUM 6
+
+const char* WIFI_SSID     = "iot2022";
+const char* WIFI_PASSWORD = "S3nhab0@";
+const char* MQTT_BROKER   = "192.168.2.100";
+const int   MQTT_PORT     = 1883;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Estado recebido da central
+bool jogoRodando = false;   // jogo/estado = START
+bool minhaVez    = false;   // jogo/modulo/ativo == MODULO_NUM
+int  resultadoFinal = 0;    // 0 = nenhum, 1 = VICTORY, 2 = DEFEAT
+char serialBomba[8] = "-----";
+
+// Dica recebida de outro grupo
+bool temDicaNova = false;
+int  grupoOrigemDica = 0;
+char conteudoDica[64] = "";
+
+bool dicasEnviadas = false;
+
+// Pedidos vindos do callback, tratados no loop()
+bool novaPartida = false;
+bool precisaRedesenhar = true;
+unsigned long ultimaTentativaMqtt = 0;
 
 const bool DEBUG_BOMBAS = true; // true para desenhar bombas e debugar
 
@@ -87,6 +130,8 @@ float intencaoX = 0, intencaoY = 0; // inclinacao atual (usada pela assistencia)
 unsigned long tempoAnterior = 0;
 unsigned long inicioCalibracao = 0;
 bool calibrado = false;
+float somaCalX = 0, somaCalY = 0;
+int amostrasCal = 0;
 int ultimaX = -1, ultimaY = -1;
 
 const float INICIO_X = ESQ + CEL_W * 0.5f;
@@ -111,6 +156,12 @@ int numParedes = 0;
 // vOcupada[y][x]: parede entre a coluna x-1 e x, na linha y
 bool hOcupada[LINHAS + 1][COLUNAS] = {};
 bool vOcupada[LINHAS][COLUNAS + 1] = {};
+
+// Envia SOLVED/ERROR. No modo de teste vai para um topico que a central ignora.
+void publicarEvento(const char* evento) {
+  if (MODO_TESTE) client.publish("jogo/modulo/" MODULO_ID "/teste", evento);
+  else            client.publish("jogo/modulo/" MODULO_ID "/evento", evento);
+}
 
 // =====================================================
 // BOMBAS INVISIVEIS
@@ -497,7 +548,8 @@ void resolverModulo() {
   velX = 0; velY = 0;
   digitalWrite(LED_VITORIA_PIN, HIGH);
   atualizarBola(); // desenha a bola parada na celula do objetivo
-  Serial.printf("MODULO RESOLVIDO (strikes: %d)\n", strikes);
+  publicarEvento("SOLVED");
+  Serial.printf("MODULO RESOLVIDO (strikes: %d) -> SOLVED enviado\n", strikes);
 }
 
 bool colidiuComParede(float x, float y, const Parede& p) {
@@ -594,7 +646,8 @@ bool moverBola(float deslocX, float deslocY, float dt) {
 
     if (verificarBomba()) {
       strikes++;
-      Serial.printf("STRIKE! Bomba pisada (total: %d)\n", strikes);
+      publicarEvento("ERROR");
+      Serial.printf("STRIKE! Bomba pisada (total: %d) -> ERROR enviado\n", strikes);
       velX = 0; velY = 0;
       animarExplosao(); reiniciarBola();
       return true;
@@ -604,43 +657,294 @@ bool moverBola(float deslocX, float deslocY, float dt) {
 }
 
 // =====================================================
-// SETUP E TELA DE CARREGAMENTO
+// TELAS FORA DO LABIRINTO
+// =====================================================
+
+enum Tela { T_NENHUMA, T_ESPERA, T_LABIRINTO, T_VITORIA, T_DERROTA };
+Tela telaAtual = T_NENHUMA;
+
+void desenharEspera(const char* mensagem) {
+  tela.fillScreen(COR_FUNDO);
+  tela.setTextDatum(MC_DATUM);
+
+  tela.setTextSize(2);
+  tela.setTextColor(TFT_WHITE, COR_FUNDO);
+  tela.drawString("LABIRINTO G" MODULO_ID, W / 2, 16);
+
+  tela.setTextColor(TFT_YELLOW, COR_FUNDO);
+  tela.drawString(mensagem, W / 2, 50);
+
+  char sn[16];
+  snprintf(sn, sizeof(sn), "SN: %s", serialBomba);
+  tela.setTextColor(TFT_DARKGREY, COR_FUNDO);
+  tela.drawString(sn, W / 2, 80);
+
+  tela.setTextSize(1);
+  if (WiFi.status() != WL_CONNECTED)      { tela.setTextColor(TFT_RED, COR_FUNDO);   tela.drawString("Wi-Fi desconectado", W / 2, 104); }
+  else if (!client.connected())           { tela.setTextColor(TFT_RED, COR_FUNDO);   tela.drawString("Sem conexao com a central", W / 2, 104); }
+  else                                    { tela.setTextColor(TFT_GREEN, COR_FUNDO); tela.drawString("Conectado a central", W / 2, 104); }
+
+  if (grupoOrigemDica != 0) {
+    char linha[48];
+    snprintf(linha, sizeof(linha), "Dica de G%d: %.30s", grupoOrigemDica, conteudoDica);
+    tela.setTextColor(TFT_CYAN, COR_FUNDO);
+    tela.drawString(linha, W / 2, 124);
+  }
+}
+
+void desenharFim(bool vitoria) {
+  uint16_t fundo = vitoria ? TFT_DARKGREEN : TFT_RED;
+  tela.fillScreen(fundo);
+  tela.setTextDatum(MC_DATUM);
+  tela.setTextColor(TFT_WHITE, fundo);
+  tela.setTextSize(3);
+  tela.drawString(vitoria ? "DESARMADA!" : "BOOM!", W / 2, H / 2 - 10);
+  tela.setTextSize(1);
+  tela.drawString(vitoria ? "Bomba desarmada" : "Bomba detonada", W / 2, H / 2 + 25);
+}
+
+// Mostra a dica na faixa de cima (no lugar dos numeros das colunas).
+// So e usada quando o jogador NAO esta jogando o labirinto.
+void desenharDicaNoTopo() {
+  if (grupoOrigemDica == 0) return;
+  char linha[48];
+  snprintf(linha, sizeof(linha), "Dica G%d: %.30s", grupoOrigemDica, conteudoDica);
+  tela.fillRect(0, 0, W, TOPO - 1, COR_FUNDO);
+  tela.setTextDatum(TL_DATUM);
+  tela.setTextSize(1);
+  tela.setTextColor(TFT_CYAN, COR_FUNDO);
+  tela.drawString(linha, 2, 0);
+}
+
+// =====================================================
+// MQTT: MENSAGENS DA CENTRAL
+// =====================================================
+// O callback so atualiza variaveis; a tela e o labirinto sao
+// tratados no loop() por atualizarEstado().
+
+void callbackMqtt(char* topic, byte* payload, unsigned int length) {
+  char msg[length + 1];
+  memcpy(msg, payload, length);
+  msg[length] = '\0';
+  while (length > 0 && (msg[length - 1] == '\r' || msg[length - 1] == '\n' || msg[length - 1] == ' ')) {
+    msg[--length] = '\0';
+  }
+  Serial.printf("[MQTT] %s = %s\n", topic, msg);
+
+  if (MODO_TESTE && (strcmp(topic, "jogo/estado") == 0 || strcmp(topic, "jogo/modulo/ativo") == 0)) {
+    Serial.println("        (ignorado: MODO_TESTE)");
+    return;
+  }
+
+  if (strcmp(topic, "jogo/estado") == 0) {
+    if (strcmp(msg, "START") == 0) {
+      // Mensagem retida: ao reconectar no meio da partida ela chega de novo.
+      // So comeca partida nova se ainda nao estava rodando.
+      if (!jogoRodando) { jogoRodando = true; resultadoFinal = 0; novaPartida = true; }
+    } else if (strcmp(msg, "RESET") == 0) {
+      jogoRodando = false; minhaVez = false; resultadoFinal = 0;
+      moduloResolvido = false;
+      digitalWrite(LED_VITORIA_PIN, LOW);
+    } else if (strcmp(msg, "VICTORY") == 0) {
+      jogoRodando = false; minhaVez = false; resultadoFinal = 1;
+    } else if (strcmp(msg, "DEFEAT") == 0) {
+      jogoRodando = false; minhaVez = false; resultadoFinal = 2;
+    }
+    precisaRedesenhar = true;
+  }
+  else if (strcmp(topic, "jogo/modulo/ativo") == 0) {
+    minhaVez = (atoi(msg) == MODULO_NUM);
+    precisaRedesenhar = true;
+  }
+  else if (strcmp(topic, "jogo/serial") == 0) {
+    strncpy(serialBomba, msg, sizeof(serialBomba) - 1);
+    serialBomba[sizeof(serialBomba) - 1] = '\0';
+    precisaRedesenhar = true;
+  }
+  else {
+    int origem = 0, pos = 0;
+    if (sscanf(topic, "jogo/modulo/" MODULO_ID "/dica/%d%n", &origem, &pos) == 1 && topic[pos] == '\0') {
+      grupoOrigemDica = origem;
+      strncpy(conteudoDica, msg, sizeof(conteudoDica) - 1);
+      conteudoDica[sizeof(conteudoDica) - 1] = '\0';
+      temDicaNova = true;
+    }
+  }
+}
+
+bool conectarMqtt() {
+  // LWT: se o modulo cair, o broker publica OFFLINE sozinho
+  if (!client.connect("Modulo_" MODULO_ID, "jogo/modulo/" MODULO_ID "/status", 0, true, "OFFLINE")) {
+    Serial.printf("[MQTT] falha ao conectar (rc=%d)\n", client.state());
+    return false;
+  }
+  client.publish("jogo/modulo/" MODULO_ID "/status", "ONLINE", true);
+  client.subscribe("jogo/estado");
+  client.subscribe("jogo/serial");
+  client.subscribe("jogo/modulo/ativo");
+  client.subscribe("jogo/modulo/" MODULO_ID "/dica/+");
+  Serial.println("[MQTT] conectado e ONLINE");
+  return true;
+}
+
+// Mantem Wi-Fi/MQTT vivos sem travar o jogo (tenta reconectar a cada 3 s)
+void manterConexao() {
+  static bool estavaConectado = false;
+  bool conectado = (WiFi.status() == WL_CONNECTED) && client.connected();
+
+  if (!conectado && WiFi.status() == WL_CONNECTED && millis() - ultimaTentativaMqtt > 3000) {
+    ultimaTentativaMqtt = millis();
+    conectado = conectarMqtt();
+  }
+  if (conectado) client.loop();
+
+  // Atualiza o aviso de conexao na tela de espera
+  if (conectado != estavaConectado) {
+    estavaConectado = conectado;
+    if (telaAtual == T_ESPERA) precisaRedesenhar = true;
+  }
+}
+
+// =====================================================
+// DICAS: POSICAO DAS BOMBAS (enviadas para a central)
+// =====================================================
+// No inicio da vez do labirinto, as 3 posicoes (ex.: "B4") sao publicadas
+// em jogo/modulo/6/dica. A central sorteia quem recebe cada uma e repassa
+// em jogo/modulo/<DESTINO>/dica/6, onde a tela de dicas do G6 (dica_g6.h)
+// mostra a posicao.
+
+void nomeCelula(int coluna, int linha, char* out) {
+  out[0] = 'A' + linha;                       // linhas A-G (lateral da tela)
+  snprintf(out + 1, 3, "%d", coluna + 1);     // colunas 1-8 (topo da tela)
+}
+
+void enviarDicasBombas() {
+  dicasEnviadas = true;
+  for (int i = 0; i < NUM_BOMBAS; i++) {
+    char cel[4];
+    nomeCelula(bombas[i].coluna, bombas[i].linha, cel);
+    if (MODO_TESTE) {
+      // No teste nao manda para a central (nao incomoda os outros grupos)
+      char m[24];
+      snprintf(m, sizeof(m), "dica: %s", cel);
+      client.publish("jogo/modulo/" MODULO_ID "/teste", m);
+    } else {
+      client.publish("jogo/modulo/" MODULO_ID "/dica", cel);
+    }
+    Serial.printf("[DICA] bomba %s%s\n", cel, MODO_TESTE ? " (teste, nao enviada a central)" : " -> central");
+  }
+}
+
+// =====================================================
+// MAQUINA DE ESTADOS DO MODULO
+// =====================================================
+
+void iniciarCalibracao() {
+  calibrado = false;
+  somaCalX = 0; somaCalY = 0; amostrasCal = 0;
+  inicioCalibracao = millis();
+}
+
+void atualizarEstado() {
+  if (novaPartida) {
+    novaPartida = false;
+    moduloResolvido = false;
+    strikes = 0;
+    dicasEnviadas = false;
+    digitalWrite(LED_VITORIA_PIN, LOW);
+    gerarMapaValido();
+    bolaX = INICIO_X; bolaY = INICIO_Y; velX = 0; velY = 0;
+    telaAtual = T_NENHUMA; // forca redesenho
+  }
+
+  // Qual tela deve aparecer agora?
+  Tela desejada;
+  const char* mensagem = "";
+  if (resultadoFinal == 1)      desejada = T_VITORIA;
+  else if (resultadoFinal == 2) desejada = T_DERROTA;
+  else if (!jogoRodando)        { desejada = T_ESPERA; mensagem = "AGUARDANDO INICIO"; }
+  else if (moduloResolvido)     desejada = T_LABIRINTO;   // fica congelado
+  else if (minhaVez)            desejada = T_LABIRINTO;   // jogando
+  else                          { desejada = T_ESPERA; mensagem = "AGUARDE SUA VEZ"; }
+
+  if (desejada != telaAtual || (precisaRedesenhar && desejada == T_ESPERA)) {
+    if (desejada == T_ESPERA) desenharEspera(mensagem);
+    else if (desejada == T_VITORIA) desenharFim(true);
+    else if (desejada == T_DERROTA) desenharFim(false);
+    else if (desejada == T_LABIRINTO && telaAtual != T_LABIRINTO) {
+      desenharMapa();
+      desenharBola();
+      if (moduloResolvido) desenharDicaNoTopo();
+      else {
+        iniciarCalibracao(); // mantenha o modulo nivelado por 2 s
+        if (!dicasEnviadas) enviarDicasBombas();
+      }
+    }
+    telaAtual = desejada;
+  }
+  precisaRedesenhar = false;
+
+  if (temDicaNova) {
+    temDicaNova = false;
+    Serial.printf("Dica recebida de G%d: %s\n", grupoOrigemDica, conteudoDica);
+    if (telaAtual == T_ESPERA) desenharEspera(mensagem);
+    else if (telaAtual == T_LABIRINTO && moduloResolvido) desenharDicaNoTopo();
+    // Durante a jogada a dica fica guardada para nao cobrir os numeros das colunas
+  }
+}
+
+// =====================================================
+// SETUP
 // =====================================================
 
 void setup() {
   Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
+  pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, HIGH); // backlight ligado
   pinMode(LED_VITORIA_PIN, OUTPUT); digitalWrite(LED_VITORIA_PIN, LOW);
-  tela.init(); 
-  tela.setRotation(3); 
-  
-  // Tela de Carregamento
+  tela.init();
+  tela.setRotation(3);
+
   tela.fillScreen(COR_FUNDO);
   tela.setTextColor(TFT_WHITE, COR_FUNDO);
   tela.setTextDatum(MC_DATUM);
   tela.setTextSize(2);
-  tela.drawString("Gerando", W / 2, (H / 2) - 15);
-  tela.drawString("Labirinto...", W / 2, (H / 2) + 10);
-  
-  Wire.begin(21, 22);
+  tela.drawString("Conectando...", W / 2, H / 2);
 
+  Wire.begin(21, 22);
   if (!mpu.begin()) {
     Serial.println("MPU6050 nao encontrado!");
-    while (true) { digitalWrite(LED_PIN, LOW); delay(500); }
+    tela.fillScreen(COR_FUNDO);
+    tela.setTextColor(TFT_RED, COR_FUNDO);
+    tela.drawString("MPU6050 nao", W / 2, H / 2 - 12);
+    tela.drawString("encontrado!", W / 2, H / 2 + 12);
+    while (true) delay(500);
   }
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
-  randomSeed((uint32_t)micros() ^ (uint32_t)analogRead(34));
-  bolaX = INICIO_X; bolaY = INICIO_Y;
+  randomSeed(esp_random());
 
-  gerarMapaValido();
-  
-  desenharMapa(); 
-  desenharBola();
+  // Wi-Fi: espera ate 10 s; se nao conectar, segue e o ESP32 tenta sozinho
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) delay(250);
+  Serial.println(WiFi.status() == WL_CONNECTED ? "Wi-Fi conectado" : "Wi-Fi ainda nao conectou");
 
-  inicioCalibracao = millis(); tempoAnterior = millis();
+  client.setServer(MQTT_BROKER, MQTT_PORT);
+  client.setCallback(callbackMqtt);
+  if (WiFi.status() == WL_CONNECTED) conectarMqtt();
+  ultimaTentativaMqtt = millis();
+
+  // O labirinto so e gerado quando a central manda START
+  // (no modo de teste, comeca jogando direto)
+  pinMode(BTN_NOVO_LABIRINTO, INPUT);
+  if (MODO_TESTE) {
+    Serial.println("*** MODO_TESTE ativo: central ignorada ***");
+    jogoRodando = true; minhaVez = true; novaPartida = true;
+  }
 }
 
 // =====================================================
@@ -648,16 +952,27 @@ void setup() {
 // =====================================================
 
 void loop() {
+  manterConexao();
+
+  // Modo de teste: botao GPIO35 gera um labirinto novo
+  static unsigned long ultimoBotao = 0;
+  if (MODO_TESTE && digitalRead(BTN_NOVO_LABIRINTO) == LOW && millis() - ultimoBotao > 500) {
+    ultimoBotao = millis();
+    novaPartida = true;
+  }
+
+  atualizarEstado();
+
+  // So joga se a partida estiver rodando, for a vez deste modulo e ainda nao resolveu
+  if (!(jogoRodando && minhaVez && !moduloResolvido)) {
+    delay(10);
+    return;
+  }
+
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
   unsigned long agora = millis();
-
-  // Modulo resolvido: nada mais se move, tela e LED ficam como estao
-  if (moduloResolvido) {
-    delay(20);
-    return;
-  }
   float dt = (agora - tempoAnterior) / 1000.0f;
   tempoAnterior = agora;
 
@@ -671,15 +986,13 @@ void loop() {
   filtroY += 0.15f * (leituraY - filtroY);
 
   if (!calibrado) {
-    static float somaX = 0, somaY = 0;
-    static int amostras = 0;
-    somaX += filtroX; somaY += filtroY; amostras++;
-
+    somaCalX += filtroX; somaCalY += filtroY; amostrasCal++;
     if (agora - inicioCalibracao >= 2000) {
-      refX = somaX / amostras; refY = somaY / amostras;
+      refX = somaCalX / amostrasCal; refY = somaCalY / amostrasCal;
       filtroX = refX; filtroY = refY;
       calibrado = true; tempoAnterior = agora;
     }
+    delay(5);
     return;
   }
 
@@ -705,12 +1018,13 @@ void loop() {
   int antigoX = roundf(bolaX), antigoY = roundf(bolaY);
 
   if (moverBola(velX * dt, velY * dt, dt)) {
-    digitalWrite(LED_PIN, HIGH); delay(5); return;
+    delay(5);
+    return;
   }
 
   if (roundf(bolaX) != antigoX || roundf(bolaY) != antigoY) {
     atualizarBola();
   }
 
-  digitalWrite(LED_PIN, HIGH); delay(5);
+  delay(5);
 }
