@@ -14,7 +14,15 @@ Adafruit_MPU6050 mpu;
 
 const int W = 240;
 const int H = 135;
-const int LED_PIN = 4;
+const int LED_PIN = 4; // na TTGO T-Display, o GPIO4 e o backlight da tela
+
+// LED verde de vitoria
+// LED verde de status do modulo (estilo KTANE): acende quando resolvido e fica aceso
+const int LED_VITORIA_PIN = 13;
+
+// Estado do modulo
+bool moduloResolvido = false;
+int strikes = 0; // bombas pisadas
 
 const bool DEBUG_BOMBAS = true; // true para desenhar bombas e debugar
 
@@ -482,13 +490,14 @@ void animarExplosao() {
   }
 }
 
-void animarVitoria() {
-  Serial.println("OBJETIVO ALCANCADO!");
-  unsigned long inicio = millis();
-  while (millis() - inicio < 500) {
-    tela.fillScreen(TFT_GREEN); delay(100);
-    tela.fillScreen(TFT_BLACK); delay(100);
-  }
+// Modulo resolvido: LED verde fixo, bola congelada no objetivo,
+// sensor ignorado ate a placa ser reiniciada.
+void resolverModulo() {
+  moduloResolvido = true;
+  velX = 0; velY = 0;
+  digitalWrite(LED_VITORIA_PIN, HIGH);
+  atualizarBola(); // desenha a bola parada na celula do objetivo
+  Serial.printf("MODULO RESOLVIDO (strikes: %d)\n", strikes);
 }
 
 bool colidiuComParede(float x, float y, const Parede& p) {
@@ -579,13 +588,13 @@ bool moverBola(float deslocX, float deslocY, float dt) {
     }
 
     if (verificarVitoria()) {
-      velX = 0; velY = 0;
-      animarVitoria(); reiniciarBola();
+      resolverModulo();
       return true;
     }
 
     if (verificarBomba()) {
-      Serial.println("BOMBA ATIVADA!");
+      strikes++;
+      Serial.printf("STRIKE! Bomba pisada (total: %d)\n", strikes);
       velX = 0; velY = 0;
       animarExplosao(); reiniciarBola();
       return true;
@@ -601,6 +610,7 @@ bool moverBola(float deslocX, float deslocY, float dt) {
 void setup() {
   Serial.begin(115200);
   pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
+  pinMode(LED_VITORIA_PIN, OUTPUT); digitalWrite(LED_VITORIA_PIN, LOW);
   tela.init(); 
   tela.setRotation(3); 
   
@@ -642,6 +652,12 @@ void loop() {
   mpu.getEvent(&a, &g, &temp);
 
   unsigned long agora = millis();
+
+  // Modulo resolvido: nada mais se move, tela e LED ficam como estao
+  if (moduloResolvido) {
+    delay(20);
+    return;
+  }
   float dt = (agora - tempoAnterior) / 1000.0f;
   tempoAnterior = agora;
 
