@@ -1,33 +1,33 @@
-#pragma once
-// =====================================================
-// TELA DE DICAS DO MODULO LABIRINTO (GRUPO 6)
-// =====================================================
-// Roda nas placas dos OUTROS grupos enquanto o labirinto (G6) e o modulo ativo.
-// A central repassa cada posicao de bomba (ex.: "B4") no topico
-//   jogo/modulo/<ID_DA_PLACA>/dica/6
-// e esta tela mostra a posicao para o jogador avisar quem esta no labirinto.
-//
-// COMO USAR NO SUPER CODIGO (placas que NAO sao o G6):
-//   1. #include "dica_g6.h"
-//   2. Quando jogo/modulo/ativo virar "6":
-//        dicaG6_iniciar(tft);
-//   3. Quando chegar mensagem em jogo/modulo/<MEU_ID>/dica/6:
-//        dicaG6_receber(tft, payload);   // payload como texto, ex.: "B4"
-//
-// Uma mesma placa pode receber mais de uma posicao (a central sorteia cada
-// uma separadamente); a tela guarda e mostra ate 3.
-// Nao muda a rotacao da tela: funciona em 240x135 com rotacao 1 ou 3.
+/*
+  Tela de dicas do modulo Labirinto (Grupo 6)
 
+  Plataforma: ESP32 TTGO T-Display (TFT 240x135).
+  Dependencias: TFT_eSPI.
+
+  Funcionamento:
+  - Roda nas placas dos outros grupos enquanto o G6 e o modulo ativo.
+  - A central repassa cada posicao de bomba (ex.: "B4") no topico jogo/modulo/<ID_DA_PLACA>/dica/6.
+  - dicaG6_iniciar(tft): chamar quando jogo/modulo/ativo virar "6"; limpa as dicas e mostra a espera.
+  - dicaG6_receber(tft, payload): chamar ao receber a dica; guarda e exibe ate 3 posicoes.
+  - Nao altera a rotacao da tela (funciona com rotacao 1 ou 3).
+*/
+
+#pragma once
+
+// bibliotecas do display e de manipulacao de texto
 #include <TFT_eSPI.h>
 #include <string.h>
 #include <ctype.h>
 
+// lista das posicoes recebidas (ate 3, com ate 7 caracteres cada)
 static const int DICA_G6_MAX = 3;
 static char dicaG6_lista[DICA_G6_MAX][8];
 static int  dicaG6_qtd = 0;
 
+// cor de fundo da tela de dicas
 static const uint16_t DICA_G6_FUNDO = TFT_BLACK;
 
+// limpa a tela e desenha o titulo com a linha separadora
 static void dicaG6_cabecalho(TFT_eSPI& tft) {
   tft.fillScreen(DICA_G6_FUNDO);
   tft.setTextDatum(MC_DATUM);
@@ -37,11 +37,12 @@ static void dicaG6_cabecalho(TFT_eSPI& tft) {
   tft.drawFastHLine(10, 26, 220, TFT_DARKGREY);
 }
 
+// redesenha a tela conforme a quantidade de dicas recebidas
 static void dicaG6_desenhar(TFT_eSPI& tft) {
   dicaG6_cabecalho(tft);
 
+  // sem dicas: mostra a espera e a instrucao para o jogador
   if (dicaG6_qtd == 0) {
-    // Esperando a central mandar uma posicao
     tft.setTextSize(2);
     tft.setTextColor(TFT_YELLOW, DICA_G6_FUNDO);
     tft.drawString("Aguardando dica...", 120, 52);
@@ -54,37 +55,38 @@ static void dicaG6_desenhar(TFT_eSPI& tft) {
     return;
   }
 
-  // Mostra as posicoes recebidas
+  // titulo no singular ou plural conforme a quantidade
   tft.setTextSize(2);
   tft.setTextColor(TFT_YELLOW, DICA_G6_FUNDO);
   tft.drawString(dicaG6_qtd == 1 ? "BOMBA EM:" : "BOMBAS EM:", 120, 40);
 
+  // monta uma linha com as posicoes separadas por dois espacos, sem estourar o buffer
   char linha[32] = "";
   for (int i = 0; i < dicaG6_qtd; i++) {
     if (i > 0) strncat(linha, "  ", sizeof(linha) - strlen(linha) - 1);
     strncat(linha, dicaG6_lista[i], sizeof(linha) - strlen(linha) - 1);
   }
-  // Quanto menos posicoes, maior a letra
+  // reduz o tamanho da fonte conforme aumenta a quantidade, para caber na largura da tela
   tft.setTextSize(dicaG6_qtd == 1 ? 5 : (dicaG6_qtd == 2 ? 4 : 3));
   tft.setTextColor(TFT_RED, DICA_G6_FUNDO);
   tft.drawString(linha, 120, 74);
 
+  // instrucao para repassar a dica a quem joga o labirinto
   tft.setTextSize(1);
   tft.setTextColor(TFT_LIGHTGREY, DICA_G6_FUNDO);
   tft.drawString("Avise quem esta jogando o LABIRINTO:", 120, 108);
   tft.drawString("a bola NAO pode passar por ai!", 120, 122);
 }
 
-// Chame quando o G6 virar o modulo ativo: limpa as dicas antigas
-// e mostra "Aguardando dica...".
+// inicia a tela quando o G6 vira o modulo ativo, descartando dicas antigas
 void dicaG6_iniciar(TFT_eSPI& tft) {
   dicaG6_qtd = 0;
   dicaG6_desenhar(tft);
 }
 
-// Chame quando chegar uma mensagem em jogo/modulo/<MEU_ID>/dica/6.
+// recebe uma dica da central e atualiza a tela
 void dicaG6_receber(TFT_eSPI& tft, const char* payload) {
-  // Limpa: tira espacos e deixa maiusculo (ex.: " b4\n" -> "B4")
+  // normaliza o texto: remove espacos e converte para maiusculo (ex.: " b4\n" -> "B4")
   char pos[8];
   int n = 0;
   for (const char* p = payload; *p && n < (int)sizeof(pos) - 1; p++) {
@@ -93,10 +95,11 @@ void dicaG6_receber(TFT_eSPI& tft, const char* payload) {
   pos[n] = '\0';
   if (n == 0) return;
 
-  // Ignora repetida
+  // ignora posicao ja recebida
   for (int i = 0; i < dicaG6_qtd; i++)
     if (strcmp(dicaG6_lista[i], pos) == 0) return;
 
+  // guarda a nova posicao se ainda houver espaco na lista
   if (dicaG6_qtd < DICA_G6_MAX) {
     strcpy(dicaG6_lista[dicaG6_qtd++], pos);
   }
